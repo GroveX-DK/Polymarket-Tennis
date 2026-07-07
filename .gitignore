@@ -1,0 +1,11 @@
+# regenerable and over GitHub's 100 MB limit (rebuild: python scripts/harvest_events.py)
+data_raw/polymarket/events_tennis.jsonl
+
+# runtime state of the dry-run bot
+pi_bot/data/paper_trades.sqlite
+pi_bot/data/update.log
+
+__pycache__/
+*.pyc
+*.tmp
+.claude/
