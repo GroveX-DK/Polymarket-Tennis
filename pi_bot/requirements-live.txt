@@ -1,0 +1,2 @@
+# Only needed for TRADE_MODE=live (paper mode is pure stdlib)
+py-clob-client>=0.17

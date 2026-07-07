@@ -5,6 +5,10 @@ data_raw/polymarket/events_tennis.jsonl
 pi_bot/data/paper_trades.sqlite
 pi_bot/data/update.log
 
+# API keys / trading credentials - never commit
+.env
+pi_bot/.env
+
 __pycache__/
 *.pyc
 *.tmp

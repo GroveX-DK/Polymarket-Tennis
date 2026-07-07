@@ -71,6 +71,34 @@ the file automatically when it changes):
 17 6 * * 1  cd /home/pi/pi_bot && /usr/bin/python3 update_ratings.py >> data/update.log 2>&1
 ```
 
+## Live trading (real money — read this first)
+
+Paper mode is the default and needs no keys. To place real orders:
+
+1. `pip install -r requirements-live.txt` (the official `py-clob-client`;
+   paper mode stays stdlib-only).
+2. `cp .env.example .env` and fill in:
+   - `TRADE_MODE=live`
+   - `POLYMARKET_PRIVATE_KEY` — the Polygon key that signs orders. **This key
+     controls your funds.** The `.env` file is gitignored; never commit it,
+     never paste the key anywhere else.
+   - `POLYMARKET_FUNDER` — your Polymarket deposit address (holds the USDC),
+     and `POLYMARKET_SIGNATURE_TYPE` (1 = email login, 2 = browser wallet).
+   - `STAKE_USDC` per trade and `MAX_OPEN_TRADES` safety cap.
+3. Restart the bot. Startup logs `*** LIVE TRADING ENABLED *** wallet 0x...`
+   or explains why it fell back to paper.
+
+Live behavior: qualifying entries are sent as marketable GTC limit buys at the
+ask via the CLOB API and held to resolution (winnings are redeemed on
+Polymarket as usual). Any order error downgrades that one trade to a paper
+record — the bot never retries an order blind. The ledger tracks paper and
+live trades separately; `python3 bot.py report` shows both.
+
+Sanity checklist before going live: fund the account with only what you're
+prepared to lose; start with `STAKE_USDC=5`; remember the backtest edge is
++5.3% per trade with a CI that only just clears zero, and ~1 trade in 14 loses
+its full stake. Run the paper dry run to ~100 settled trades first.
+
 ## Strategy parameters (top of `bot.py`)
 
 | param | value | why |

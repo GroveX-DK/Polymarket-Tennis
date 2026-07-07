@@ -1,6 +1,6 @@
-"""24/7 Polymarket ATP dry-run bot for Raspberry Pi (pure stdlib, <60 MB RSS).
+"""24/7 Polymarket ATP bot for Raspberry Pi (stdlib-only in paper mode).
 
-Paper-trades the one strategy that survived the 2025-2026 backtest (REPORT.md):
+Trades the one strategy that survived the 2025-2026 backtest (REPORT.md):
 
     Buy the Polymarket favorite ~24h before match start when
       - its taker (ask) price is in [0.80, 0.97]
@@ -8,6 +8,11 @@ Paper-trades the one strategy that survived the 2025-2026 backtest (REPORT.md):
       - the calibrated surface-blended Elo model also gives that side >= 0.70
 
 Backtest result: +5.3% ROI, 147 bets, 95% CI [+0.3%, +9.7%] at 1c slippage.
+
+Modes (set TRADE_MODE in pi_bot/.env - see .env.example):
+    paper (default)  dry run, no keys needed, pure stdlib
+    live             places real GTC limit orders via py-clob-client using the
+                     API keys in .env; falls back to paper per-trade on errors
 
 Usage:
     python bot.py            # run forever, one scan every POLL_MINUTES
@@ -48,6 +53,20 @@ GAMMA = "https://gamma-api.polymarket.com"
 VS = re.compile(r"^\s*(.*?)\s*[:–-]\s*(.+?)\s+vs\.?\s+(.+?)\s*$", re.I)
 NOT_TOUR = ("wta", "itf", "junior", "challenger", "doubles", "exhibition",
             "utr", "uts", "ncaa", "college")
+
+
+def load_env():
+    """Read KEY=VALUE lines from pi_bot/.env into os.environ (existing wins)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip("'").strip('"'))
 
 
 def log(msg):
@@ -97,7 +116,17 @@ def open_db():
         hours_out     REAL,
         status        TEXT DEFAULT 'open',
         pnl           REAL,
-        resolved_utc  TEXT)""")
+        resolved_utc  TEXT,
+        mode          TEXT DEFAULT 'paper',
+        stake         REAL DEFAULT 1.0,
+        token_id      TEXT,
+        order_id      TEXT)""")
+    for col, decl in [("mode", "TEXT DEFAULT 'paper'"), ("stake", "REAL DEFAULT 1.0"),
+                      ("token_id", "TEXT"), ("order_id", "TEXT")]:
+        try:
+            db.execute(f"ALTER TABLE trades ADD COLUMN {col} {decl}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
     db.execute("""CREATE TABLE IF NOT EXISTS skips(
         market_id TEXT PRIMARY KEY, reason TEXT, seen_utc TEXT)""")
     db.commit()
@@ -167,12 +196,14 @@ def fetch_open_tennis_events():
     return events
 
 
-def scan_for_entries(db, ratings):
+def scan_for_entries(db, ratings, trader=None):
     now = datetime.now(timezone.utc)
     events = fetch_open_tennis_events()
     if not events:
         log("no events returned (API hiccup?) - skipping entry scan")
         return 0
+    stake_usdc = float(os.environ.get("STAKE_USDC", "5"))
+    max_open_live = int(os.environ.get("MAX_OPEN_TRADES", "10"))
     placed = 0
     for ev in events:
         m_t = VS.match((ev.get("title") or "").replace("–", ":"))
@@ -236,16 +267,35 @@ def scan_for_entries(db, ratings):
                 db.execute("INSERT OR IGNORE INTO skips VALUES(?,?,?)",
                            (mid, f"elo {model_p:.2f} < {ELO_MIN}", now.isoformat()))
                 continue
+            try:
+                token_id = json.loads(mk.get("clobTokenIds") or "[]")[idx]
+            except (ValueError, IndexError):
+                token_id = None
+            mode, stake, order_id = "paper", STAKE, None
+            if trader is not None and token_id:
+                n_live = db.execute("SELECT COUNT(*) FROM trades WHERE "
+                                    "mode='live' AND status='open'").fetchone()[0]
+                if n_live >= max_open_live:
+                    log(f"live cap reached ({n_live} open) - recording paper only")
+                else:
+                    try:
+                        order_id = trader.buy(token_id, buy, stake_usdc)
+                        mode, stake = "live", stake_usdc
+                    except Exception as e:
+                        log(f"LIVE ORDER FAILED ({e!r}) - recording paper only")
             db.execute(
                 "INSERT INTO trades(market_id, entered_utc, game_start_utc, tournament,"
                 " match_title, side, outcome_index, price, bid, ask, model_p, volume,"
-                " hours_out) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " hours_out, mode, stake, token_id, order_id)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (mid, now.isoformat(), gs.isoformat(), tourn,
                  f"{name_a} vs {name_b}", side, idx, buy, bid, ask,
-                 round(model_p, 4), vol, round(hrs_out, 2)))
+                 round(model_p, 4), vol, round(hrs_out, 2),
+                 mode, stake, token_id, order_id))
             placed += 1
-            log(f"PAPER BUY  {side} @ {buy:.3f}  ({tourn}: {name_a} vs {name_b}, "
-                f"model {model_p:.2f}, vol ${vol:,.0f}, starts in {hrs_out:.0f}h)")
+            log(f"{mode.upper():5} BUY  {side} @ {buy:.3f} (${stake:.2f})  "
+                f"({tourn}: {name_a} vs {name_b}, model {model_p:.2f}, "
+                f"vol ${vol:,.0f}, starts in {hrs_out:.0f}h)")
     db.commit()
     return placed
 
@@ -254,10 +304,10 @@ def scan_for_entries(db, ratings):
 
 def resolve_open_trades(db):
     now = datetime.now(timezone.utc)
-    rows = db.execute("SELECT market_id, game_start_utc, side, outcome_index, price "
-                      "FROM trades WHERE status='open'").fetchall()
+    rows = db.execute("SELECT market_id, game_start_utc, side, outcome_index, price, "
+                      "stake FROM trades WHERE status='open'").fetchall()
     resolved = 0
-    for mid, gs_iso, side, idx, price in rows:
+    for mid, gs_iso, side, idx, price, stake in rows:
         gs = parse_iso(gs_iso)
         if gs and now < gs + timedelta(hours=2):
             continue  # match can't be over yet
@@ -268,12 +318,13 @@ def resolve_open_trades(db):
             prices = [float(x) for x in json.loads(mk.get("outcomePrices") or "[]")]
         except Exception:
             prices = []
+        stake = stake or 1.0
         if len(prices) != 2 or abs(prices[0] - prices[1]) < 0.9:
             status, pnl = "void", 0.0   # 50/50 resolution / refund / bad data
         elif prices[idx] > 0.5:
-            status, pnl = "won", STAKE * (1.0 - price) / price
+            status, pnl = "won", stake * (1.0 - price) / price
         else:
-            status, pnl = "lost", -STAKE
+            status, pnl = "lost", -stake
         db.execute("UPDATE trades SET status=?, pnl=?, resolved_utc=? WHERE market_id=?",
                    (status, round(pnl, 4), now.isoformat(), mid))
         resolved += 1
@@ -286,58 +337,84 @@ def resolve_open_trades(db):
 # ---------------- reporting ----------------
 
 def report(db):
-    q = db.execute("SELECT status, COUNT(*), COALESCE(SUM(pnl),0) FROM trades "
-                   "GROUP BY status").fetchall()
-    counts = {s: (n, p) for s, n, p in q}
-    n_open = counts.get("open", (0, 0))[0]
-    n_won, pnl_won = counts.get("won", (0, 0.0))
-    n_lost, pnl_lost = counts.get("lost", (0, 0.0))
-    n_void = counts.get("void", (0, 0))[0]
-    settled = n_won + n_lost
-    total_pnl = pnl_won + pnl_lost
-    print(f"paper ledger: {settled + n_open + n_void} trades "
-          f"({n_open} open, {n_void} void)")
-    if settled:
-        print(f"settled: {settled}  hit {n_won/settled*100:.1f}%  "
-              f"PnL {total_pnl:+.2f} units  ROI {total_pnl/(settled*STAKE)*100:+.1f}% "
-              f"(flat ${STAKE:.0f} stakes, taker fills)")
+    for mode in ("paper", "live"):
+        q = db.execute("SELECT status, COUNT(*), COALESCE(SUM(pnl),0), "
+                       "COALESCE(SUM(stake),0) FROM trades WHERE mode=? "
+                       "GROUP BY status", (mode,)).fetchall()
+        if not q:
+            if mode == "paper":
+                print("paper ledger: 0 trades")
+            continue
+        counts = {s: (n, p, st) for s, n, p, st in q}
+        n_open = counts.get("open", (0, 0, 0))[0]
+        n_won, pnl_won, st_won = counts.get("won", (0, 0.0, 0.0))
+        n_lost, pnl_lost, st_lost = counts.get("lost", (0, 0.0, 0.0))
+        n_void = counts.get("void", (0, 0, 0))[0]
+        settled = n_won + n_lost
+        total_pnl = pnl_won + pnl_lost
+        staked = st_won + st_lost
+        print(f"{mode} ledger: {settled + n_open + n_void} trades "
+              f"({n_open} open, {n_void} void)")
+        if settled:
+            print(f"  settled: {settled}  hit {n_won/settled*100:.1f}%  "
+                  f"PnL ${total_pnl:+.2f} on ${staked:.2f} staked  "
+                  f"ROI {total_pnl/staked*100:+.1f}% (taker fills)")
     for row in db.execute(
-            "SELECT entered_utc, match_title, side, price, model_p, status, pnl "
+            "SELECT entered_utc, match_title, side, price, model_p, status, pnl, mode "
             "FROM trades ORDER BY entered_utc DESC LIMIT 15"):
-        ent, title, side, price, mp, status, pnl = row
+        ent, title, side, price, mp, status, pnl, mode = row
         pnl_s = f"{pnl:+.2f}" if pnl is not None else "  -  "
-        print(f"  {ent[:16]}  {status:4}  {pnl_s}  {side} @ {price:.2f} "
+        print(f"  {ent[:16]}  {mode:5} {status:4}  {pnl_s}  {side} @ {price:.2f} "
               f"(model {mp:.2f})  [{title}]")
 
 
 # ---------------- main loop ----------------
 
-def cycle(db, ratings):
+def cycle(db, ratings, trader=None):
     ratings.reload_if_stale()
-    placed = scan_for_entries(db, ratings)
+    placed = scan_for_entries(db, ratings, trader)
     resolved = resolve_open_trades(db)
     n, pnl = db.execute("SELECT COUNT(*), COALESCE(SUM(pnl),0) FROM trades "
                         "WHERE status IN ('won','lost')").fetchone()
     log(f"cycle done: +{placed} entries, {resolved} resolved; "
-        f"lifetime {n} settled, PnL {pnl:+.2f} units")
+        f"lifetime {n} settled, PnL {pnl:+.2f}")
+
+
+def make_trader():
+    """Return a LiveTrader when TRADE_MODE=live and credentials work, else None."""
+    if os.environ.get("TRADE_MODE", "paper").strip().lower() != "live":
+        return None
+    try:
+        from executor import LiveTrader
+        trader = LiveTrader()
+        log(f"*** LIVE TRADING ENABLED *** wallet {trader.address}  "
+            f"stake ${float(os.environ.get('STAKE_USDC', '5')):.2f}/trade, "
+            f"max {os.environ.get('MAX_OPEN_TRADES', '10')} open")
+        return trader
+    except Exception as e:
+        log(f"live trading unavailable ({e!r}) - running in PAPER mode")
+        return None
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Polymarket ATP dry-run paper trader")
+    ap = argparse.ArgumentParser(description="Polymarket ATP strategy bot")
     ap.add_argument("command", nargs="?", default="run", choices=["run", "report"])
     ap.add_argument("--once", action="store_true", help="single cycle then exit")
     args = ap.parse_args()
 
+    load_env()
     db = open_db()
     if args.command == "report":
         report(db)
         return
+    trader = make_trader()
     ratings = Ratings()
     log(f"strategy: fav ask [{PRICE_LO},{PRICE_HI}], elo>={ELO_MIN}, "
-        f"vol>=${VOL_MIN:,.0f}, window {HRS_MIN}-{HRS_MAX}h, spread<={MAX_SPREAD}")
+        f"vol>=${VOL_MIN:,.0f}, window {HRS_MIN}-{HRS_MAX}h, spread<={MAX_SPREAD}, "
+        f"mode={'LIVE' if trader else 'paper'}")
     while True:
         try:
-            cycle(db, ratings)
+            cycle(db, ratings, trader)
         except Exception as e:
             log(f"cycle error: {e!r}")
         if args.once:
