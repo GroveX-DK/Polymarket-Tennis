@@ -144,24 +144,36 @@ context: best-of-5, round, indoor, home country, retirement/walkover risk;
 base: overall + surface Elo, rank, rank points, age, height. Model:
 HistGradientBoosting trained on 2000–2020, both orientations (symmetric).
 
+A second iteration (v2) added the remaining cheap-data items: **margin of
+victory** (games-share Elo + game-dominance EWMA parsed from scores),
+**fatigue/schedule** (court minutes last 7/14 days, matches last 14 days, days
+since last match, with match dates approximated from tournament start + round),
+and **opponent-adjusted serve/return** (SPW/RPW samples shifted by opponent
+strength vs the league running mean).
+
 | Predictor (holdout 2021–2024, n = 9,005, identical rows) | log-loss | accuracy |
 |---|---|---|
 | Calibrated Elo (report model) | 0.6232 | 63.6% |
 | GBM, Elo features only (ablation) | 0.6253 | 63.7% |
-| **GBM, micro-stats + context** | **0.6130** | **64.9%** |
+| GBM v1: micro-stats + context | 0.6130 | 64.9% |
+| **GBM v2: + margin/fatigue/opp-adjusted** | **0.6097** | **65.6%** |
 
-The improvement (+0.0102 log-loss, bootstrap 95% CI [+0.0071, +0.0131]) is real
-but closes only ~a third of the gap to the market. Top non-Elo features: **age
-difference** (aging curves), rank points, best-of-5, return points won, home
-advantage.
+Both steps are statistically solid (v1 vs Elo +0.0102, CI [+0.0071, +0.0131];
+v2 vs v1 +0.0033, CI [+0.0015, +0.0050]). **Games-share Elo is the single most
+important feature in the final model** (permutation importance 0.033, ahead of
+surface Elo), confirming margin-of-victory as the cheapest big win; age
+difference, days-since-last-match, minutes last 14 days, opponent-adjusted
+return points, best-of-5 and home advantage all contribute smaller real amounts.
 
 On the 2025 Polymarket matched sample (n = 793 with prices at start) the story
-doesn't change: PM 0.5631, GBM 0.5938, Elo 0.5905 — the market stays ~0.03
-ahead, and a chronological two-fold logistic blend gives the GBM **zero-to-negative
-weight on top of the PM price** (same conclusion as for Elo: no added
-information). One suggestive positive: as the confirmation filter for the 24h
-favorites strategy on this subsample, GBM ≥ 0.70 beat Elo ≥ 0.70 (+9.9% vs
-+7.4% ROI on 41 bets) — but that's a one-bet difference, far from significant.
+doesn't change: PM 0.5631 vs GBM v2 0.5948 / v1 0.5938 / Elo 0.5905 — the
+0.004 spread between our models is sample noise while the market stays ~0.03
+ahead, and a chronological two-fold logistic blend gives the GBM
+**zero-to-negative weight on top of the PM price** (same conclusion as for Elo:
+no added information). The suggestive v1 result as a strategy-confirmation
+filter (+9.9% vs Elo's +7.4% ROI on 41 bets) **did not replicate with v2**
+(+7.0%) — treat the filter ranking as noise; the strategy's edge does not
+depend on which honest model confirms it.
 
 Practical note: the live bot keeps the Elo filter — TML stats data lags weeks
 behind (its 2026 file ends in January), so a GBM filter can't be fed reliably
