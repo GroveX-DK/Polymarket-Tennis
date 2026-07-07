@@ -24,8 +24,10 @@ pi_bot/data/matches.csv.gz (refresh weekly with update_ratings.py).
 """
 import argparse
 import json
+import math
 import os
 import re
+import signal
 import sqlite3
 import sys
 import time
@@ -368,6 +370,98 @@ def report(db):
               f"(model {mp:.2f})  [{title}]")
 
 
+# ---------------- session report (pure-stdlib SVG chart) ----------------
+
+SVG_PATH = os.path.join(DATA_DIR, "session_report.svg")
+BACKTEST_ROI = 0.053  # expectation line: +5.3%/trade from REPORT.md
+
+
+def session_report(db, path=SVG_PATH):
+    """Write an SVG chart of every settled trade: equity curve vs the backtest
+    expectation, plus how well the model and the entry prices were calibrated.
+    Returns the path, or None when there is nothing to chart yet."""
+    rows = db.execute(
+        "SELECT price, model_p, stake, pnl, status, mode, "
+        "COALESCE(resolved_utc, entered_utc) AS t FROM trades "
+        "WHERE status IN ('won','lost') ORDER BY t").fetchall()
+    n_open = db.execute("SELECT COUNT(*) FROM trades WHERE status='open'").fetchone()[0]
+    if not rows:
+        log(f"session report: no settled trades yet ({n_open} open) - no chart written")
+        return None
+
+    cum, exp = [0.0], [0.0]
+    pnl_sum = staked = wins = llm = llp = 0.0
+    n_live = 0
+    for price, model_p, stake, pnl, status, mode, _t in rows:
+        stake = stake or 1.0
+        pnl_sum += pnl
+        staked += stake
+        y = 1.0 if status == "won" else 0.0
+        wins += y
+        n_live += mode == "live"
+        llm += -(y * math.log(max(model_p, 1e-6))
+                 + (1 - y) * math.log(max(1 - model_p, 1e-6)))
+        llp += -(y * math.log(max(price, 1e-6))
+                 + (1 - y) * math.log(max(1 - price, 1e-6)))
+        cum.append(pnl_sum)
+        exp.append(BACKTEST_ROI * staked)
+    n = len(rows)
+    roi = pnl_sum / staked
+    avg_price = sum(r[0] for r in rows) / n
+
+    # geometry
+    W, H, X0, X1, Y0, Y1 = 840, 460, 62, 815, 118, 415
+    lo = min(0.0, min(cum), min(exp))
+    hi = max(0.5, max(cum), max(exp))
+    pad = 0.08 * (hi - lo) or 0.5
+    lo, hi = lo - pad, hi + pad
+    fx = lambda i: X0 + (X1 - X0) * i / max(n, 1)
+    fy = lambda v: Y1 - (Y1 - Y0) * (v - lo) / (hi - lo)
+    pts = lambda ys: " ".join(f"{fx(i):.1f},{fy(v):.1f}" for i, v in enumerate(ys))
+
+    yticks = []
+    step = max(round((hi - lo) / 5, 1), 0.1)
+    v = math.ceil(lo / step) * step
+    while v <= hi:
+        yticks.append(
+            f'<line x1="{X0}" y1="{fy(v):.1f}" x2="{X1}" y2="{fy(v):.1f}" '
+            f'stroke="#ddd" stroke-width="1"/>'
+            f'<text x="{X0-8}" y="{fy(v)+4:.1f}" text-anchor="end" '
+            f'font-size="11" fill="#666">{v:+.1f}</text>')
+        v = round(v + step, 6)
+    xticks = []
+    for i in range(0, n + 1, max(1, n // 8)):
+        xticks.append(f'<text x="{fx(i):.1f}" y="{Y1+16}" text-anchor="middle" '
+                      f'font-size="11" fill="#666">{i}</text>')
+
+    mode_txt = f"{n - n_live} paper / {n_live} live" if n_live else "paper"
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}"
+  viewBox="0 0 {W} {H}" font-family="Helvetica,Arial,sans-serif">
+<rect width="{W}" height="{H}" fill="white"/>
+<text x="{X0}" y="28" font-size="17" font-weight="bold" fill="#111">
+Polymarket ATP favorites bot - session report ({stamp})</text>
+<text x="{X0}" y="52" font-size="13" fill="#333">
+{n} settled ({mode_txt}), {n_open} open | hit {wins/n*100:.1f}% (entry prices implied {avg_price*100:.1f}%) | PnL ${pnl_sum:+.2f} on ${staked:.2f} staked = {roi*100:+.1f}%/trade (backtest {BACKTEST_ROI*100:+.1f}%)</text>
+<text x="{X0}" y="72" font-size="13" fill="#333">
+model log-loss {llm/n:.4f} vs entry-price log-loss {llp/n:.4f} (lower = sharper; ties are expected - the model confirms, the price decides)</text>
+<text x="{X0}" y="92" font-size="12" fill="#777">
+green = cumulative PnL after each settled trade | dashed = backtest expectation (+{BACKTEST_ROI*100:.1f}% of stake per trade) | judge nothing before ~100 settled trades</text>
+{''.join(yticks)}{''.join(xticks)}
+<line x1="{X0}" y1="{fy(0):.1f}" x2="{X1}" y2="{fy(0):.1f}" stroke="#000" stroke-width="1"/>
+<polyline points="{pts(exp)}" fill="none" stroke="#999" stroke-width="1.5" stroke-dasharray="6,4"/>
+<polyline points="{pts(cum)}" fill="none" stroke="#16a34a" stroke-width="2.5"/>
+<text x="{(X0+X1)//2}" y="{H-8}" text-anchor="middle" font-size="12" fill="#666">settled trades</text>
+<text x="16" y="{(Y0+Y1)//2}" font-size="12" fill="#666" transform="rotate(-90 16 {(Y0+Y1)//2})">cumulative PnL ($)</text>
+</svg>
+"""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(svg)
+    log(f"session report written: {path}  "
+        f"({n} settled, ROI {roi*100:+.1f}% vs backtest {BACKTEST_ROI*100:+.1f}%)")
+    return path
+
+
 # ---------------- main loop ----------------
 
 def cycle(db, ratings, trader=None):
@@ -406,20 +500,33 @@ def main():
     db = open_db()
     if args.command == "report":
         report(db)
+        session_report(db)
         return
     trader = make_trader()
     ratings = Ratings()
     log(f"strategy: fav ask [{PRICE_LO},{PRICE_HI}], elo>={ELO_MIN}, "
         f"vol>=${VOL_MIN:,.0f}, window {HRS_MIN}-{HRS_MAX}h, spread<={MAX_SPREAD}, "
         f"mode={'LIVE' if trader else 'paper'}")
-    while True:
-        try:
-            cycle(db, ratings, trader)
-        except Exception as e:
-            log(f"cycle error: {e!r}")
-        if args.once:
-            break
-        time.sleep(POLL_MINUTES * 60)
+
+    def _sigterm(*_):  # systemd stop behaves like Ctrl+C
+        raise KeyboardInterrupt
+    try:
+        signal.signal(signal.SIGTERM, _sigterm)
+    except (ValueError, OSError):
+        pass
+    try:
+        while True:
+            try:
+                cycle(db, ratings, trader)
+            except Exception as e:
+                log(f"cycle error: {e!r}")
+            if args.once:
+                break
+            time.sleep(POLL_MINUTES * 60)
+    except KeyboardInterrupt:
+        log("stopped (Ctrl+C) - writing session report")
+    finally:
+        session_report(db)
 
 
 if __name__ == "__main__":

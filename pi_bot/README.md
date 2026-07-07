@@ -35,6 +35,14 @@ A paper entry is logged as `PAPER BUY <player> @ <ask> ...` and settled
 automatically a few hours after the match from the market's on-chain
 resolution (`won` / `lost` / `void` for 50-50 refunds).
 
+**Ctrl+C (or `systemctl stop`) writes a session report** to
+`data/session_report.svg` before exiting — a pure-stdlib SVG chart with the
+equity curve of every settled trade against the backtest's +5.3%/trade
+expectation line, hit rate vs what the entry prices implied, and the model's
+log-loss vs the entry prices'. `python3 bot.py report` regenerates it any
+time without stopping the bot (open it in any browser; from a headless Pi:
+`scp pi:pi_bot/data/session_report.svg .`).
+
 ## Raspberry Pi deployment
 
 Copy the `pi_bot/` folder (with `data/matches.csv.gz` + `data/tournaments.json`
